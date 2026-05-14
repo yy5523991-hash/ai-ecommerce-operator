@@ -1,53 +1,142 @@
+param(
+    [string]$CodexHome = ""
+)
+
 $ErrorActionPreference = "Stop"
 
 $SkillName = "ai-ecommerce-operator"
 $Repo = "yy5523991-hash/ai-ecommerce-operator"
 $Branch = "main"
+$SkillPath = "."
+$RepoIsPrivate = $false
 
-if ($env:CODEX_HOME) {
-    $CodexHome = $env:CODEX_HOME
-} else {
-    $CodexHome = Join-Path $HOME ".codex"
-}
-
-$SkillsDir = Join-Path $CodexHome "skills"
-$TargetDir = Join-Path $SkillsDir $SkillName
-$TempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("$SkillName-" + [System.Guid]::NewGuid().ToString("N"))
-$ZipPath = Join-Path $TempRoot "skill.zip"
-$ArchiveUrl = "https://github.com/$Repo/archive/refs/heads/$Branch.zip"
-
-New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
-New-Item -ItemType Directory -Force -Path $SkillsDir | Out-Null
-
-Write-Host "Downloading $SkillName from GitHub..."
-Invoke-WebRequest -Uri $ArchiveUrl -OutFile $ZipPath
-
-Write-Host "Extracting..."
-Expand-Archive -Path $ZipPath -DestinationPath $TempRoot -Force
-$SourceDir = Get-ChildItem -Path $TempRoot -Directory | Select-Object -First 1
-if (-not $SourceDir) {
-    throw "Downloaded archive did not contain a skill folder."
-}
-
-foreach ($Required in @("SKILL.md", "agents", "references", "scripts")) {
-    if (-not (Test-Path (Join-Path $SourceDir.FullName $Required))) {
-        throw "Missing required skill item: $Required"
+function Initialize-ProxyFromWindows {
+    if ($env:HTTPS_PROXY -or $env:HTTP_PROXY) { return }
+    try {
+        $settings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction Stop
+        if ($settings.ProxyEnable -ne 1 -or -not $settings.ProxyServer) { return }
+        $proxy = [string]$settings.ProxyServer
+        if ($proxy -match "=") {
+            $parts = @{}
+            foreach ($item in $proxy.Split(";")) {
+                $kv = $item.Split("=", 2)
+                if ($kv.Count -eq 2) { $parts[$kv[0].ToLowerInvariant()] = $kv[1] }
+            }
+            $proxy = $parts["https"]
+            if (-not $proxy) { $proxy = $parts["http"] }
+            if (-not $proxy) { return }
+        }
+        if ($proxy -notmatch "^[a-zA-Z][a-zA-Z0-9+.-]*://") { $proxy = "http://$proxy" }
+        $env:HTTP_PROXY = $proxy
+        $env:HTTPS_PROXY = $proxy
+    } catch {
+        return
     }
 }
 
-if (Test-Path $TargetDir) {
-    $BackupDir = "$TargetDir.backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    Write-Host "Existing skill found. Moving it to $BackupDir"
-    Move-Item -Path $TargetDir -Destination $BackupDir
+function Resolve-CodexHome {
+    param([string]$Override)
+    if ($Override) { return $Override }
+    if ($env:CODEX_HOME) { return $env:CODEX_HOME }
+    return (Join-Path $HOME ".codex")
 }
 
-New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
-Copy-Item -Path (Join-Path $SourceDir.FullName "SKILL.md") -Destination $TargetDir -Force
-Copy-Item -Path (Join-Path $SourceDir.FullName "agents") -Destination $TargetDir -Recurse -Force
-Copy-Item -Path (Join-Path $SourceDir.FullName "references") -Destination $TargetDir -Recurse -Force
-Copy-Item -Path (Join-Path $SourceDir.FullName "scripts") -Destination $TargetDir -Recurse -Force
+function Get-GhPath {
+    $cmd = Get-Command gh -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $common = "C:\Program Files\GitHub CLI\gh.exe"
+    if (Test-Path $common) { return $common }
+    return ""
+}
 
-Remove-Item -Path $TempRoot -Recurse -Force
+function Ensure-GitHubCli {
+    $gh = Get-GhPath
+    if ($gh) { return $gh }
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        throw "GitHub CLI is required for private repositories. Install it from https://cli.github.com/ and rerun this script."
+    }
+    Write-Host "Installing GitHub CLI..."
+    winget install --id GitHub.cli --exact --silent --accept-package-agreements --accept-source-agreements
+    $gh = Get-GhPath
+    if (-not $gh) { throw "GitHub CLI installation finished, but gh.exe was not found. Restart PowerShell and rerun this script." }
+    return $gh
+}
 
-Write-Host "Installed: $TargetDir"
-Write-Host "Restart Codex if the skill does not appear immediately."
+function Ensure-GhAuth {
+    param([string]$Gh)
+    & $Gh auth status *> $null
+    if ($LASTEXITCODE -eq 0) { return }
+    Write-Host "GitHub login is required. Complete the browser/device authorization that opens next."
+    & $Gh auth login --hostname github.com --web --git-protocol https --scopes repo
+    if ($LASTEXITCODE -ne 0) { throw "GitHub authentication failed." }
+}
+
+function Download-RepoArchive {
+    param(
+        [string]$Repo,
+        [string]$Branch,
+        [bool]$Private,
+        [string]$OutputZip
+    )
+    $archiveUrl = "https://github.com/$Repo/archive/refs/heads/$Branch.zip"
+    if ($Private) {
+        $gh = Ensure-GitHubCli
+        Ensure-GhAuth -Gh $gh
+        $token = (& $gh auth token).Trim()
+        Invoke-WebRequest -Uri $archiveUrl -Headers @{ Authorization = "Bearer $token" } -OutFile $OutputZip
+    } else {
+        Invoke-WebRequest -Uri $archiveUrl -OutFile $OutputZip
+    }
+}
+
+function Install-SkillFromArchive {
+    param(
+        [string]$SkillName,
+        [string]$Repo,
+        [string]$Branch,
+        [string]$SkillPath,
+        [bool]$RepoIsPrivate,
+        [string]$CodexHome
+    )
+
+    $skillsDir = Join-Path $CodexHome "skills"
+    $targetDir = Join-Path $skillsDir $SkillName
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("$SkillName-" + [System.Guid]::NewGuid().ToString("N"))
+    $zipPath = Join-Path $tempRoot "repo.zip"
+
+    New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $skillsDir | Out-Null
+
+    Write-Host "Downloading $SkillName..."
+    Download-RepoArchive -Repo $Repo -Branch $Branch -Private $RepoIsPrivate -OutputZip $zipPath
+
+    Expand-Archive -Path $zipPath -DestinationPath $tempRoot -Force
+    $repoRoot = Get-ChildItem -Path $tempRoot -Directory | Select-Object -First 1
+    if (-not $repoRoot) { throw "Downloaded archive did not contain repository files." }
+
+    if ($SkillPath -eq "." -or $SkillPath -eq "") {
+        $sourceDir = $repoRoot.FullName
+    } else {
+        $sourceDir = Join-Path $repoRoot.FullName $SkillPath
+    }
+    if (-not (Test-Path (Join-Path $sourceDir "SKILL.md"))) {
+        throw "SKILL.md not found in $Repo/$SkillPath"
+    }
+
+    if (Test-Path $targetDir) {
+        $backupDir = "$targetDir.backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        Write-Host "Existing $SkillName found. Backup: $backupDir"
+        Move-Item -Path $targetDir -Destination $backupDir
+    }
+
+    New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+    Copy-Item -Path (Join-Path $sourceDir "*") -Destination $targetDir -Recurse -Force
+    Remove-Item -Path $TempRoot -Recurse -Force
+    Write-Host "Installed $SkillName -> $targetDir"
+}
+
+$null = Initialize-ProxyFromWindows
+$resolvedCodexHome = Resolve-CodexHome -Override $CodexHome
+Install-SkillFromArchive -SkillName $SkillName -Repo $Repo -Branch $Branch -SkillPath $SkillPath -RepoIsPrivate $RepoIsPrivate -CodexHome $resolvedCodexHome
+Write-Host "Done. Restart Codex if the skill does not appear immediately."
