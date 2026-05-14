@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI电商运营专家"
+  short_description: "生成小红书等平台的低预算电商开店闭环方案、选品评分、SEO标题、图文引流和每日运营打卡。"
+  default_prompt: "请用 ai-ecommerce-operator 为零基础低预算个人店生成一份可复制执行的电商运营闭环手册。"
